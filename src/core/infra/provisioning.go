@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3381,120 +3382,99 @@ func CreateVm(wg *sync.WaitGroup, nsId string, mciId string, vmInfoData *model.V
 	vmInfoData.CspSshKeyId = callResult.KeyPairIId.SystemId
 
 	if option == "register" {
-		// Reconstuct resource IDs
-		// Spec
-		if callResult.VMSpecName != "" {
-			resourceListInNs, err := resource.ListResource(model.SystemCommonNs, model.StrSpec, "csp_spec_name", callResult.VMSpecName)
+
+		// Helper function to find resource ID by filtering ConnectionName using reflection
+		findResource := func(ns, rType, key, val string) (string, interface{}) {
+			if val == "" {
+				return "", nil
+			}
+
+			listResult, err := resource.ListResource(ns, rType, key, val)
 			if err != nil {
-				log.Error().Err(err).Msg("Failed to list Spec")
+				return "", nil
+			}
+
+			v := reflect.ValueOf(listResult)
+			if v.Kind() != reflect.Slice {
+				return "", nil
+			}
+
+			for i := 0; i < v.Len(); i++ {
+				item := v.Index(i)
+				// Check ConnectionName
+				if item.FieldByName("ConnectionName").String() == requestBody.ConnectionName {
+					idField := item.FieldByName("Id")
+					if idField.IsValid() {
+						return idField.String(), item.Interface()
+					}
+				}
+			}
+			return "", nil
+		}
+
+		// 1. Spec Matching
+		if id, _ := findResource(model.SystemCommonNs, model.StrSpec, "csp_spec_name", callResult.VMSpecName); id != "" {
+			vmInfoData.SpecId = id
+		}
+
+		// 2. Image Matching
+		targetImage := callResult.ImageIId.SystemId
+		if targetImage == "" {
+			targetImage = callResult.ImageIId.NameId
+		}
+
+		if targetImage != "" {
+			// Try Custom Image first (csp_image_id)
+			if id, _ := findResource(nsId, model.StrCustomImage, "csp_image_id", targetImage); id != "" {
+				vmInfoData.ImageId = id
+				customImageFlag = true
+				log.Debug().Msgf("CustomImage found: %s", id)
+
+				// Try Public Image second (csp_image_name)
+			} else if id, _ := findResource(model.SystemCommonNs, model.StrImage, "csp_image_name", targetImage); id != "" {
+				vmInfoData.ImageId = id
+				log.Info().Msgf("Public Image found: %s", id)
+
 			} else {
-				resourcesInNs := resourceListInNs.([]model.SpecInfo)
-				for _, res := range resourcesInNs {
-					if res.ConnectionName == requestBody.ConnectionName {
-						vmInfoData.SpecId = res.Id
+				log.Error().Msgf("Dependency Missing: Cannot find Image (CSP ID: %s)", targetImage)
+			}
+		}
+
+		// 3. VNet & Subnet Matching
+		if vNetId, vNetObj := findResource(nsId, model.StrVNet, "cspResourceName", callResult.VpcIID.SystemId); vNetId != "" {
+			vmInfoData.VNetId = vNetId
+
+			// Find Subnet within the VNet object
+			if vNetInfo, ok := vNetObj.(model.VNetInfo); ok {
+				targetSubnet := callResult.SubnetIID.SystemId
+				if targetSubnet == "" {
+					targetSubnet = callResult.SubnetIID.NameId
+				}
+
+				for _, subnet := range vNetInfo.SubnetInfoList {
+					if subnet.CspResourceId == targetSubnet || subnet.CspResourceName == targetSubnet {
+						vmInfoData.SubnetId = subnet.Id
 						break
 					}
 				}
 			}
-		}
-
-		// Image
-		targetImageName := callResult.ImageIId.SystemId
-		if targetImageName == "" {
-			targetImageName = callResult.ImageIId.NameId
-		}
-
-		if targetImageName != "" {
-
-			findImageFunc := func(ns, rType, filterKey string) bool {
-				listResult, err := resource.ListResource(ns, rType, filterKey, targetImageName)
-				if err != nil {
-					return false
-				}
-
-				if imgs, ok := listResult.([]model.ImageInfo); ok {
-					for _, res := range imgs {
-						if res.ConnectionName == requestBody.ConnectionName {
-							vmInfoData.ImageId = res.Id
-							return true
-						}
-					}
-				}
-				return false
-			}
-
-			if findImageFunc(nsId, model.StrCustomImage, "csp_image_id") {
-				customImageFlag = true
-				log.Debug().Msgf("CustomImage found in Current NS: %s", vmInfoData.ImageId)
-
-			} else if findImageFunc(model.SystemCommonNs, model.StrImage, "csp_image_name") {
-				log.Info().Msgf("Public Image found in SystemCommonNs: %s", vmInfoData.ImageId)
-
-			} else {
-				errMsg := fmt.Sprintf("Dependency Missing: Cannot find Image (CSP ID: %s) in TB.", targetImageName)
-				log.Error().Msg(errMsg)
-			}
-		}
-
-		// vNet
-		resourceListInNs, err := resource.ListResource(nsId, model.StrVNet, "cspResourceName", callResult.VpcIID.SystemId)
-		if err != nil {
-			log.Error().Err(err).Msg("")
 		} else {
-			resourcesInNs := resourceListInNs.([]model.VNetInfo) // type assertion
-			for _, resource := range resourcesInNs {
-				if resource.ConnectionName == requestBody.ConnectionName {
-					vmInfoData.VNetId = resource.Id
-
-					// subnet
-					targetSubnet := callResult.SubnetIID.SystemId
-
-					if targetSubnet == "" {
-						targetSubnet = callResult.SubnetIID.NameId
-					}
-
-					for _, subnet := range resource.SubnetInfoList {
-						if subnet.CspResourceId == targetSubnet {
-							vmInfoData.SubnetId = subnet.Id
-							break
-						}
-					}
-					break
-				}
-			}
+			log.Error().Msg("Failed to find VNet")
 		}
 
-		// SecurityGroups
+		// 4. Security Groups Matching
 		var matchedSgIds []string
 		for _, sgIID := range callResult.SecurityGroupIIds {
-			resourceListInNs, err := resource.ListResource(nsId, model.StrSecurityGroup, "cspResourceName", sgIID.SystemId)
-			if err != nil {
-				log.Error().Err(err).Msg("")
-			} else {
-				resourcesInNs := resourceListInNs.([]model.SecurityGroupInfo)
-				for _, resource := range resourcesInNs {
-					if resource.ConnectionName == requestBody.ConnectionName {
-						matchedSgIds = append(matchedSgIds, resource.Id)
-						break
-					}
-				}
+			if id, _ := findResource(nsId, model.StrSecurityGroup, "cspResourceName", sgIID.SystemId); id != "" {
+				matchedSgIds = append(matchedSgIds, id)
 			}
 		}
 		vmInfoData.SecurityGroupIds = matchedSgIds
 
-		// access Key
-		resourceListInNs, err = resource.ListResource(nsId, model.StrSSHKey, "cspResourceName", callResult.KeyPairIId.SystemId)
-		if err != nil {
-			log.Error().Err(err).Msg("")
-		} else {
-			resourcesInNs := resourceListInNs.([]model.SshKeyInfo) // type assertion
-			for _, resource := range resourcesInNs {
-				if resource.ConnectionName == requestBody.ConnectionName {
-					vmInfoData.SshKeyId = resource.Id
-				}
-			}
+		// 5. SSH Key Matching
+		if id, _ := findResource(nsId, model.StrSSHKey, "cspResourceName", callResult.KeyPairIId.SystemId); id != "" {
+			vmInfoData.SshKeyId = id
 		}
-
 	}
 
 	if customImageFlag == false {
